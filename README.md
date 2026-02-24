@@ -1,4 +1,4 @@
-# Sync Integrity Verifier (MVP)
+# Sync Integrity Verifier
 
 Sync Integrity Verifier is a lightweight validation tool built for IT professionals to prevent accidental data loss during system wipes, OS upgrades, and device migrations — particularly in environments relying on OneDrive.
 
