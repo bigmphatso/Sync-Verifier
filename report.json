@@ -1,0 +1,11 @@
+{
+  "directory": "/home/hunter/Documents/reign/Synch Verifier",
+  "scanned_files": 12,
+  "verified_files": 12,
+  "cloud_only_files": 0,
+  "integrity_issues": 0,
+  "risk_level": "LOW",
+  "recommendation": "No integrity risks detected",
+  "duration_seconds": 0.002622365951538086,
+  "issues": []
+}
