@@ -1,6 +1,43 @@
 # Sync Integrity Verifier (MVP)
 
-A lightweight integrity scanner designed for IT pre-wipe and migration checks.
+Sync Integrity Verifier is a lightweight validation tool built for IT professionals to prevent accidental data loss during system wipes, OS upgrades, and device migrations — particularly in environments relying on OneDrive.
+
+Rather than performing backups, the tool verifies that files are fully present, consistent, and safe before critical operations.
+
+---
+
+## When would you need this?
+
+Use Sync Integrity Verifier when:
+
+• Preparing a device for OS reinstallation  
+• Upgrading from Windows 10 to Windows 11  
+• Migrating user data to a new machine  
+• Validating OneDrive sync completion  
+• Verifying backups before formatting or wiping  
+• Investigating suspected sync inconsistencies  
+
+---
+
+## What problem does it solve?
+
+Cloud sync indicators can be misleading. Files and folders may appear present while their contents are incomplete, cloud-only, or improperly synced.
+
+Sync Integrity Verifier performs a fast metadata-based comparison to detect:
+
+• Missing files  
+• Size mismatches  
+• Cloud-only placeholders  
+• Incomplete sync states  
+
+---
+
+## Core Objective
+
+Provide IT staff with a clear, fast, and reliable answer to one critical question:
+
+**"Is this device safe to wipe?"**
+**"Are all file really backup?, are my files safe?"**
 
 ## What Is Actually Compared
 - Source: the selected scan directory (`--scan <path>` or UI selected path).
