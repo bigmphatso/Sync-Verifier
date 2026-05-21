@@ -1,129 +1,42 @@
 # Sync Integrity Verifier
 
-Sync Integrity Verifier is a lightweight validation tool built for IT professionals to prevent accidental data loss during system wipes, OS upgrades, and device migrations — particularly in environments relying on OneDrive.
+[Download SyncVerifier.exe](dist/SyncVerifier.exe)
 
-Rather than performing backups, the tool verifies that files are fully present, consistent, and safe before critical operations.
+Sync Integrity Verifier is now a guided, step-by-step Windows application for checking whether important local folders are safely mirrored in OneDrive.
 
----
+## Guided Flow
 
-## When would you need this?
+1. Identify OneDrive automatically.
+   The app checks configured OneDrive accounts, environment variables, and sync client status with an animated loading state.
 
-Use Sync Integrity Verifier when:
+2. Choose what to compare.
+   The default option checks the primary OneDrive folders: Desktop, Documents, and Pictures.
 
-• Preparing a device for OS reinstallation  
-• Upgrading from Windows 10 to Windows 11  
-• Migrating user data to a new machine  
-• Validating OneDrive sync completion  
-• Verifying backups before formatting or wiping  
-• Investigating suspected sync inconsistencies  
+3. Pick a broader scope when needed.
+   You can scan the entire user profile, the entire drive, or a custom folder.
 
----
+4. Confirm and run.
+   The app resolves the matching OneDrive comparison target, then runs the integrity check.
 
-## What problem does it solve?
-
-Cloud sync indicators can be misleading. Files and folders may appear present while their contents are incomplete, cloud-only, or improperly synced.
-
-Sync Integrity Verifier performs a fast metadata-based comparison to detect:
-
-• Missing files  
-• Size mismatches  
-• Cloud-only placeholders  
-• Incomplete sync states  
-
----
-
-## Core Objective
-
-Provide IT staff with a clear, fast, and reliable answer to one critical question:
-
-**"Is this device safe to wipe?"**
-**"Are all file really backup?, are my files safe?"**
-
-## What Is Actually Compared
-- Source: the selected scan directory (`--scan <path>` or UI selected path).
-- Target: OneDrive comparison root (enforced).
-- The app detects local OneDrive and maps likely counterparts:
-  - `Desktop` -> `OneDrive/Desktop`
-  - `Documents` -> `OneDrive/Documents`
-  - `Downloads` -> `OneDrive/Downloads`
-  - otherwise fallback -> `OneDrive`
-
-Per file, comparison checks are:
-1. counterpart existence in target
-2. size match
-3. optional hash match (`--hash-verify`)
-
-## OneDrive Preflight (Enforced)
-Scans run only when OneDrive is both:
-1. Configured for the current user (detectable root path).
-2. Sync-available (Windows sync client process running).
-
-If preflight fails, scan is blocked and a clear error is shown.
-
-## MVP Features
-- Right-click compatible scan command (`--scan <path>`)
-- Full desktop app mode (`--ui`)
-- Safe-to-wipe mode (`--safe-to-wipe`)
-- Detection categories:
-  - Cloud-only files (Windows attribute-based)
-  - Missing counterpart in OneDrive target
-  - Size mismatches
-  - Optional hash mismatches
-  - Incomplete/transient sync files
-- Risk scoring:
-  - `LOW`
-  - `MEDIUM`
-  - `HIGH`
-- Exports:
-  - `.pdf`
-  - `.csv`
-  - `.json`
-  - `.txt`
+5. Review and export.
+   Results show verified files, compared files, cloud-only files, integrity issues, risk level, and export options.
 
 ## Run
-Basic scan:
-```bash
-python3 -m app.main --scan "."
-```
 
-Optional hash verification:
-```bash
-python3 -m app.main --scan "." --hash-verify
-```
-
-Use explicit comparison root:
-```bash
-python3 -m app.main --scan "." --compare-root "~/OneDrive/Documents"
-```
-
-Launch desktop UI:
-```bash
-python3 -m app.main --ui
-```
-
-Safe-to-wipe scan:
-```bash
-python3 -m app.main --safe-to-wipe
-```
-
-## Context Menu (Windows)
-Install for current user:
 ```powershell
-py -m app.main --install-context-menu
+py -m app.main --ui
 ```
 
-Generate `.reg` file for deployment tooling:
+## Build Executable
+
 ```powershell
-py -m app.main --generate-reg
+.\build_exe.ps1
 ```
 
-Remove integration:
-```powershell
-py -m app.main --uninstall-context-menu
+The built app is written to:
+
+```text
+dist\SyncVerifier.exe
 ```
 
-## Packaging Notes (Windows)
-For installer delivery (`.msi` / `.exe`):
-1. Package with `pyinstaller` or `cx_Freeze`.
-2. Build installer with WiX / Inno Setup.
-3. Register Start Menu shortcut, optional desktop shortcut, and run `--install-context-menu` post-install.
+The build script keeps PyInstaller's temporary work files outside the project folder. This avoids OneDrive locking intermediate files such as `build\SyncVerifier\localpycs` during rebuilds.

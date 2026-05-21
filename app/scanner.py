@@ -9,7 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable
 
 CACHE_FILE = Path.home() / ".sync_integrity_verifier_cache.json"
 
@@ -19,13 +19,16 @@ FILE_ATTRIBUTE_UNPINNED = 0x00100000
 FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x00040000
 FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
 
+PRIMARY_ONEDRIVE_FOLDERS = ("Desktop", "Documents", "Pictures")
+COMMON_SCAN_FOLDERS = PRIMARY_ONEDRIVE_FOLDERS + ("Downloads", "Music", "Videos")
+
 
 @dataclass
 class FileIssue:
     file_path: str
     issue_type: str
-    local_size: Optional[int]
-    cloud_size: Optional[int]
+    local_size: int | None
+    cloud_size: int | None
     severity: str
     message: str
 
@@ -33,7 +36,7 @@ class FileIssue:
 @dataclass
 class ScanResult:
     directory: str
-    comparison_target: Optional[str] = None
+    comparison_target: str | None = None
     hash_verification_enabled: bool = False
     scanned_files: int = 0
     compared_files: int = 0
@@ -43,14 +46,15 @@ class ScanResult:
     cloud_only_files: int = 0
     integrity_issues: int = 0
     risk_level: str = "LOW"
-    recommendation: str = "Safe to proceed"
-    issues: List[FileIssue] = field(default_factory=list)
+    recommendation: str = "No integrity risks detected"
+    issues: list[FileIssue] = field(default_factory=list)
+    folder_summaries: list[dict[str, str | int]] = field(default_factory=list)
     started_at: float = 0.0
     finished_at: float = 0.0
 
     @property
     def duration_seconds(self) -> float:
-        if self.finished_at and self.started_at:
+        if self.started_at and self.finished_at:
             return max(self.finished_at - self.started_at, 0.0)
         return 0.0
 
@@ -59,13 +63,13 @@ class ScanResult:
 class OneDriveStatus:
     configured: bool
     sync_available: bool
-    root: Optional[Path]
+    root: Path | None
     reason: str
 
 
 @dataclass
 class InspectOutcome:
-    issues: List[FileIssue] = field(default_factory=list)
+    issues: list[FileIssue] = field(default_factory=list)
     compared: bool = False
     hash_checked: bool = False
 
@@ -75,7 +79,7 @@ class SyncScanner:
         self._lock = threading.Lock()
         self._cache = self._load_cache()
 
-    def _load_cache(self) -> Dict[str, Dict[str, float]]:
+    def _load_cache(self) -> dict[str, dict[str, float]]:
         if not CACHE_FILE.exists():
             return {}
         try:
@@ -92,9 +96,9 @@ class SyncScanner:
     def scan(
         self,
         root_path: str,
-        progress_callback: Optional[Callable[[int, int], None]] = None,
-        cancel_event: Optional[threading.Event] = None,
-        compare_root: Optional[str] = None,
+        progress_callback: Callable[[int, int], None] | None = None,
+        cancel_event: threading.Event | None = None,
+        compare_root: str | None = None,
         hash_verify: bool = False,
         hash_algorithm: str = "sha256",
     ) -> ScanResult:
@@ -110,7 +114,6 @@ class SyncScanner:
 
         file_paths = self._collect_files(root, cancel_event)
         total_files = len(file_paths)
-
         if total_files == 0:
             result.finished_at = time.time()
             return result
@@ -118,26 +121,24 @@ class SyncScanner:
         workers = min(32, (os.cpu_count() or 4) * 2)
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [
-                executor.submit(self._inspect_file, p, root, comparison_target, hash_verify, hash_algorithm)
-                for p in file_paths
+                executor.submit(self._inspect_file, path, root, comparison_target, hash_verify, hash_algorithm)
+                for path in file_paths
             ]
             for index, future in enumerate(futures, start=1):
                 if cancel_event and cancel_event.is_set():
                     break
                 outcome = future.result()
                 result.scanned_files += 1
-                if outcome.compared:
-                    result.compared_files += 1
-                if outcome.hash_checked:
-                    result.hash_files_checked += 1
+                result.compared_files += int(outcome.compared)
+                result.hash_files_checked += int(outcome.hash_checked)
 
-                for file_issue in outcome.issues:
-                    result.issues.append(file_issue)
-                    if file_issue.issue_type == "cloud_only":
+                for issue in outcome.issues:
+                    result.issues.append(issue)
+                    if issue.issue_type == "cloud_only":
                         result.cloud_only_files += 1
                     else:
                         result.integrity_issues += 1
-                    if file_issue.issue_type == "onedrive_hash_mismatch":
+                    if issue.issue_type == "onedrive_hash_mismatch":
                         result.hash_mismatches += 1
 
                 if progress_callback:
@@ -149,17 +150,16 @@ class SyncScanner:
         self._save_cache()
         return result
 
-    def _collect_files(self, root: Path, cancel_event: Optional[threading.Event]) -> List[Path]:
-        files: List[Path] = []
+    def _collect_files(self, root: Path, cancel_event: threading.Event | None) -> list[Path]:
+        files: list[Path] = []
         for current_root, dirs, filenames in os.walk(root, topdown=True):
             dirs[:] = [d for d in dirs if d not in {"$RECYCLE.BIN", "System Volume Information", ".git"}]
             if cancel_event and cancel_event.is_set():
                 break
-            for name in filenames:
-                files.append(Path(current_root) / name)
+            files.extend(Path(current_root) / name for name in filenames)
         return files
 
-    def _win_attributes(self, path: Path) -> Optional[int]:
+    def _win_attributes(self, path: Path) -> int | None:
         if os.name != "nt":
             return None
         import ctypes
@@ -173,7 +173,7 @@ class SyncScanner:
         self,
         file_path: Path,
         scan_root: Path,
-        comparison_target: Optional[Path],
+        comparison_target: Path | None,
         hash_verify: bool,
         hash_algorithm: str,
     ) -> InspectOutcome:
@@ -183,28 +183,20 @@ class SyncScanner:
             stat = file_path.stat()
         except OSError:
             outcome.issues.append(
-                FileIssue(
-                    file_path=str(file_path),
-                    issue_type="missing",
-                    local_size=None,
-                    cloud_size=None,
-                    severity="critical",
-                    message="File was inaccessible during scan",
-                )
+                FileIssue(str(file_path), "missing", None, None, "critical", "File was inaccessible during scan")
             )
             return outcome
 
         attrs = self._win_attributes(file_path)
-        is_cloud_only = self._is_cloud_only(attrs)
-        if is_cloud_only:
+        if self._is_cloud_only(attrs):
             outcome.issues.append(
                 FileIssue(
-                    file_path=str(file_path),
-                    issue_type="cloud_only",
-                    local_size=stat.st_size,
-                    cloud_size=None,
-                    severity="warning",
-                    message="File is cloud-only and not guaranteed local for wipe",
+                    str(file_path),
+                    "cloud_only",
+                    stat.st_size,
+                    None,
+                    "warning",
+                    "File is cloud-only and not guaranteed local for wipe",
                 )
             )
 
@@ -218,36 +210,30 @@ class SyncScanner:
             if stat.st_size < previous_size and stat.st_mtime >= previous_mtime:
                 outcome.issues.append(
                     FileIssue(
-                        file_path=str(file_path),
-                        issue_type="size_mismatch",
-                        local_size=stat.st_size,
-                        cloud_size=previous_size,
-                        severity="critical",
-                        message="Local size shrank compared to previous synced metadata snapshot",
+                        str(file_path),
+                        "size_mismatch",
+                        stat.st_size,
+                        previous_size,
+                        "critical",
+                        "Local size shrank compared to previous synced metadata snapshot",
                     )
                 )
 
         if self._looks_incomplete_sync(file_path, stat.st_size, attrs):
             outcome.issues.append(
                 FileIssue(
-                    file_path=str(file_path),
-                    issue_type="incomplete_sync",
-                    local_size=stat.st_size,
-                    cloud_size=None,
-                    severity="critical",
-                    message="File appears partially synced or transient",
+                    str(file_path),
+                    "incomplete_sync",
+                    stat.st_size,
+                    None,
+                    "critical",
+                    "File appears partially synced or transient",
                 )
             )
 
         if comparison_target:
             self._compare_against_target(
-                outcome=outcome,
-                file_path=file_path,
-                scan_root=scan_root,
-                local_size=stat.st_size,
-                comparison_target=comparison_target,
-                hash_verify=hash_verify,
-                hash_algorithm=hash_algorithm,
+                outcome, file_path, scan_root, stat.st_size, comparison_target, hash_verify, hash_algorithm
             )
 
         return outcome
@@ -273,12 +259,12 @@ class SyncScanner:
         if not target_file.exists():
             outcome.issues.append(
                 FileIssue(
-                    file_path=str(file_path),
-                    issue_type="onedrive_missing",
-                    local_size=local_size,
-                    cloud_size=None,
-                    severity="critical",
-                    message="No matching file found in OneDrive comparison target",
+                    str(file_path),
+                    "onedrive_missing",
+                    local_size,
+                    None,
+                    "critical",
+                    "No matching file found in OneDrive comparison target",
                 )
             )
             return
@@ -288,12 +274,12 @@ class SyncScanner:
         except OSError:
             outcome.issues.append(
                 FileIssue(
-                    file_path=str(file_path),
-                    issue_type="onedrive_inaccessible",
-                    local_size=local_size,
-                    cloud_size=None,
-                    severity="critical",
-                    message="Matching file exists in comparison target but could not be read",
+                    str(file_path),
+                    "onedrive_inaccessible",
+                    local_size,
+                    None,
+                    "critical",
+                    "Matching file exists in comparison target but could not be read",
                 )
             )
             return
@@ -301,12 +287,12 @@ class SyncScanner:
         if local_size != target_stat.st_size:
             outcome.issues.append(
                 FileIssue(
-                    file_path=str(file_path),
-                    issue_type="onedrive_size_mismatch",
-                    local_size=local_size,
-                    cloud_size=target_stat.st_size,
-                    severity="critical",
-                    message="Size mismatch between selected path and OneDrive target",
+                    str(file_path),
+                    "onedrive_size_mismatch",
+                    local_size,
+                    target_stat.st_size,
+                    "critical",
+                    "Size mismatch between selected path and OneDrive target",
                 )
             )
             return
@@ -318,28 +304,28 @@ class SyncScanner:
             if local_hash is None or target_hash is None:
                 outcome.issues.append(
                     FileIssue(
-                        file_path=str(file_path),
-                        issue_type="hash_unavailable",
-                        local_size=local_size,
-                        cloud_size=target_stat.st_size,
-                        severity="warning",
-                        message="Hash verification skipped because one side could not be read",
+                        str(file_path),
+                        "hash_unavailable",
+                        local_size,
+                        target_stat.st_size,
+                        "warning",
+                        "Hash verification skipped because one side could not be read",
                     )
                 )
                 return
             if local_hash != target_hash:
                 outcome.issues.append(
                     FileIssue(
-                        file_path=str(file_path),
-                        issue_type="onedrive_hash_mismatch",
-                        local_size=local_size,
-                        cloud_size=target_stat.st_size,
-                        severity="critical",
-                        message="Content hash mismatch between selected path and OneDrive target",
+                        str(file_path),
+                        "onedrive_hash_mismatch",
+                        local_size,
+                        target_stat.st_size,
+                        "critical",
+                        "Content hash mismatch between selected path and OneDrive target",
                     )
                 )
 
-    def _hash_file(self, path: Path, algorithm: str) -> Optional[str]:
+    def _hash_file(self, path: Path, algorithm: str) -> str | None:
         try:
             digest = hashlib.new(algorithm)
         except ValueError:
@@ -347,16 +333,13 @@ class SyncScanner:
 
         try:
             with path.open("rb") as file_handle:
-                while True:
-                    chunk = file_handle.read(1024 * 1024)
-                    if not chunk:
-                        break
+                while chunk := file_handle.read(1024 * 1024):
                     digest.update(chunk)
             return digest.hexdigest()
         except OSError:
             return None
 
-    def _is_cloud_only(self, attrs: Optional[int]) -> bool:
+    def _is_cloud_only(self, attrs: int | None) -> bool:
         if attrs is None:
             return False
         offline = bool(attrs & FILE_ATTRIBUTE_OFFLINE)
@@ -377,46 +360,41 @@ class SyncScanner:
             )
         )
 
-    def _looks_incomplete_sync(self, file_path: Path, size: int, attrs: Optional[int]) -> bool:
-        suffix = file_path.suffix.lower()
-        transient_suffixes = {".tmp", ".partial", ".download", ".crdownload"}
-        if suffix in transient_suffixes:
+    def _looks_incomplete_sync(self, file_path: Path, size: int, attrs: int | None) -> bool:
+        if file_path.suffix.lower() in {".tmp", ".partial", ".download", ".crdownload"}:
             return True
-
-        if size == 0 and suffix in {".docx", ".xlsx", ".pptx", ".pdf", ".pst", ".zip"}:
-            if attrs is not None and self._has_cloud_marker(attrs):
-                return True
+        if size == 0 and file_path.suffix.lower() in {".docx", ".xlsx", ".pptx", ".pdf", ".pst", ".zip"}:
+            return attrs is not None and self._has_cloud_marker(attrs)
         return False
 
     def _risk_profile(self, result: ScanResult) -> tuple[str, str]:
         critical = sum(1 for issue in result.issues if issue.severity == "critical")
         warnings = sum(1 for issue in result.issues if issue.severity == "warning")
+        if critical:
+            return "HIGH", "Resolve sync integrity issues before wipe."
+        if warnings:
+            return "MEDIUM", "Review cloud-only files before wipe."
+        return "LOW", "No integrity risks detected."
 
-        if critical >= 1:
-            return "HIGH", "Resolve sync integrity issues before wipe"
-        if warnings >= 1:
-            return "MEDIUM", "Review cloud-only files before wipe"
-        return "LOW", "No integrity risks detected"
 
+def detect_onedrive_root() -> Path | None:
+    candidates: list[Path] = []
 
-def detect_onedrive_root() -> Optional[Path]:
-    candidates: List[Path] = []
-
-    env_candidate = os.environ.get("OneDrive") or os.environ.get("ONEDRIVE")
-    if env_candidate:
-        candidates.append(Path(env_candidate).expanduser())
+    for env_name in ("OneDrive", "OneDriveCommercial", "OneDriveConsumer", "ONEDRIVE"):
+        if value := os.environ.get(env_name):
+            candidates.append(Path(value).expanduser())
 
     candidates.extend(_onedrive_roots_from_registry())
     candidates.append(Path.home() / "OneDrive")
+    candidates.extend(path for path in Path.home().parent.glob("OneDrive*") if path.is_dir())
 
     for candidate in candidates:
-        if candidate.exists():
+        if candidate.exists() and candidate.is_dir():
             return candidate.resolve()
-
     return None
 
 
-def _onedrive_roots_from_registry() -> List[Path]:
+def _onedrive_roots_from_registry() -> list[Path]:
     if os.name != "nt":
         return []
 
@@ -425,14 +403,13 @@ def _onedrive_roots_from_registry() -> List[Path]:
     except ImportError:
         return []
 
-    roots: List[Path] = []
+    roots: list[Path] = []
     base = r"Software\Microsoft\OneDrive\Accounts"
     account_names = ("Personal", "Business1", "Business2", "Business3", "Business4")
 
     for account in account_names:
-        key_path = f"{base}\\{account}"
         try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, f"{base}\\{account}") as key:
                 user_folder, _ = winreg.QueryValueEx(key, "UserFolder")
                 if user_folder:
                     roots.append(Path(str(user_folder)).expanduser())
@@ -444,7 +421,6 @@ def _onedrive_roots_from_registry() -> List[Path]:
 def _is_onedrive_process_running() -> bool:
     if os.name != "nt":
         return False
-
     try:
         completed = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq OneDrive.exe"],
@@ -455,50 +431,26 @@ def _is_onedrive_process_running() -> bool:
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
-
-    stdout = completed.stdout.lower()
-    return "onedrive.exe" in stdout
+    return "onedrive.exe" in completed.stdout.lower()
 
 
 def check_onedrive_sync_status() -> OneDriveStatus:
     root = detect_onedrive_root()
     if not root:
-        return OneDriveStatus(
-            configured=False,
-            sync_available=False,
-            root=None,
-            reason="OneDrive is not configured for this user profile.",
-        )
-
+        return OneDriveStatus(False, False, None, "OneDrive is not configured for this user profile.")
     if not root.exists() or not root.is_dir():
-        return OneDriveStatus(
-            configured=True,
-            sync_available=False,
-            root=root,
-            reason="OneDrive root path is configured but not accessible.",
-        )
-
+        return OneDriveStatus(True, False, root, "OneDrive root path is configured but not accessible.")
     if os.name != "nt":
-        return OneDriveStatus(
-            configured=True,
-            sync_available=False,
-            root=root,
-            reason="Sync availability check is only supported on Windows.",
-        )
+        return OneDriveStatus(True, True, root, "OneDrive folder detected.")
 
-    if not _is_onedrive_process_running():
-        return OneDriveStatus(
-            configured=True,
-            sync_available=False,
-            root=root,
-            reason="OneDrive is configured but sync client is not running.",
-        )
+    if _is_onedrive_process_running():
+        return OneDriveStatus(True, True, root, "OneDrive folder detected and sync client appears to be running.")
 
     return OneDriveStatus(
-        configured=True,
-        sync_available=True,
-        root=root,
-        reason="OneDrive is configured and sync client is running.",
+        True,
+        True,
+        root,
+        "OneDrive folder detected. Sync client process was not confirmed, so check OneDrive status before wiping.",
     )
 
 
@@ -511,28 +463,77 @@ def resolve_onedrive_compare_root(scan_root: Path, onedrive_root: Path) -> Path:
 
     try:
         scan_root.relative_to(onedrive_root)
+        if scan_root.name in COMMON_SCAN_FOLDERS:
+            return scan_root
         return onedrive_root
     except ValueError:
         pass
 
-    well_known = {"Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos"}
-    if scan_root.name in well_known:
+    if scan_root.name in COMMON_SCAN_FOLDERS:
         return onedrive_root / scan_root.name
-
     if scan_root.parent == Path.home():
         return onedrive_root / scan_root.name
-
     return onedrive_root
 
 
-def safe_to_wipe_paths() -> List[Path]:
+def _windows_known_folder_paths() -> dict[str, Path]:
+    if os.name != "nt":
+        return {}
+
+    try:
+        import winreg
+    except ImportError:
+        return {}
+
+    value_names = {
+        "Desktop": "Desktop",
+        "Documents": "Personal",
+        "Pictures": "My Pictures",
+    }
+    paths: dict[str, Path] = {}
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            for label, value_name in value_names.items():
+                try:
+                    raw_value, _ = winreg.QueryValueEx(key, value_name)
+                except OSError:
+                    continue
+                expanded = os.path.expandvars(str(raw_value))
+                path = Path(expanded).expanduser()
+                if path.exists() and path.is_dir():
+                    paths[label] = path.resolve()
+    except OSError:
+        return paths
+
+    return paths
+
+
+def default_profile_paths() -> list[Path]:
     home = Path.home()
-    candidates = [
-        home / "Desktop",
-        home / "Documents",
-        home / "Downloads",
-    ]
+    known_folders = _windows_known_folder_paths()
     one_drive = detect_onedrive_root()
-    if one_drive:
-        candidates.append(one_drive)
-    return [p for p in candidates if p.exists()]
+    paths: list[Path] = []
+
+    for name in PRIMARY_ONEDRIVE_FOLDERS:
+        candidates = [
+            known_folders.get(name),
+            home / name,
+            one_drive / name if one_drive else None,
+        ]
+        for candidate in candidates:
+            if candidate and candidate.exists() and candidate.is_dir():
+                resolved = candidate.resolve()
+                if resolved not in paths:
+                    paths.append(resolved)
+                break
+
+    return paths
+
+
+def safe_to_wipe_paths() -> list[Path]:
+    paths = default_profile_paths()
+    if one_drive := detect_onedrive_root():
+        paths.append(one_drive)
+    return paths

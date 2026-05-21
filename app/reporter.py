@@ -21,14 +21,11 @@ def _human_size(size: int | None) -> str:
 
 
 def result_to_text(result: ScanResult) -> str:
-    comparison_target = result.comparison_target or "None"
-    hash_mode = "ON" if result.hash_verification_enabled else "OFF"
-
     lines = [
         "SYNC INTEGRITY REPORT",
         f"Directory: {result.directory}",
-        f"Comparison Target: {comparison_target}",
-        f"Hash Verification: {hash_mode}",
+        f"Comparison Target: {result.comparison_target or 'None'}",
+        f"Hash Verification: {'ON' if result.hash_verification_enabled else 'OFF'}",
         "",
         f"Scanned Files: {result.scanned_files}",
         f"Compared Files: {result.compared_files}",
@@ -56,9 +53,8 @@ def result_to_text(result: ScanResult) -> str:
 
 
 def export_csv(result: ScanResult, output_file: str) -> None:
-    path = Path(output_file)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
+    with Path(output_file).open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
         writer.writerow(["file", "issue", "local_size", "cloud_size", "severity", "message"])
         for issue in result.issues:
             writer.writerow(
@@ -74,7 +70,6 @@ def export_csv(result: ScanResult, output_file: str) -> None:
 
 
 def export_json(result: ScanResult, output_file: str) -> None:
-    path = Path(output_file)
     payload = {
         "directory": result.directory,
         "comparison_target": result.comparison_target,
@@ -91,7 +86,7 @@ def export_json(result: ScanResult, output_file: str) -> None:
         "duration_seconds": result.duration_seconds,
         "issues": [issue.__dict__ for issue in result.issues],
     }
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    Path(output_file).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def _escape_pdf_text(text: str) -> str:
@@ -121,29 +116,25 @@ def _pdf_lines(result: ScanResult) -> Iterable[str]:
 
 
 def export_pdf(result: ScanResult, output_file: str) -> None:
-    # Minimal PDF writer to avoid external dependencies.
     lines = list(_pdf_lines(result))
     text_commands = ["BT", "/F1 10 Tf", "50 780 Td"]
-    for i, line in enumerate(lines):
-        if i > 0:
+    for index, line in enumerate(lines):
+        if index:
             text_commands.append("0 -14 Td")
         text_commands.append(f"({_escape_pdf_text(line)}) Tj")
     text_commands.append("ET")
     stream = "\n".join(text_commands).encode("utf-8")
 
-    objects = []
-    objects.append(b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n")
-    objects.append(b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n")
-    objects.append(
-        b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n"
-    )
-    objects.append(b"4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n")
-    objects.append(f"5 0 obj << /Length {len(stream)} >> stream\n".encode("utf-8") + stream + b"\nendstream endobj\n")
+    objects = [
+        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
+        b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n",
+        b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n",
+        b"4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n",
+        f"5 0 obj << /Length {len(stream)} >> stream\n".encode("utf-8") + stream + b"\nendstream endobj\n",
+    ]
 
-    header = b"%PDF-1.4\n"
+    content = bytearray(b"%PDF-1.4\n")
     xref_positions = []
-    content = bytearray(header)
-
     for obj in objects:
         xref_positions.append(len(content))
         content.extend(obj)
@@ -151,16 +142,11 @@ def export_pdf(result: ScanResult, output_file: str) -> None:
     xref_start = len(content)
     content.extend(f"xref\n0 {len(objects) + 1}\n".encode("utf-8"))
     content.extend(b"0000000000 65535 f \n")
-    for pos in xref_positions:
-        content.extend(f"{pos:010d} 00000 n \n".encode("utf-8"))
-
+    for position in xref_positions:
+        content.extend(f"{position:010d} 00000 n \n".encode("utf-8"))
     content.extend(
-        (
-            f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\n"
-            f"startxref\n{xref_start}\n%%EOF\n"
-        ).encode("utf-8")
+        f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n".encode("utf-8")
     )
-
     Path(output_file).write_bytes(content)
 
 

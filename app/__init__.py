@@ -1,1 +1,1 @@
-__all__ = ["main", "scanner", "reporter", "ui"]
+"""Sync Integrity Verifier application package."""

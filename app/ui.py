@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import threading
 import time
 from pathlib import Path
@@ -8,60 +9,64 @@ from tkinter import BooleanVar, StringVar, Tk, Toplevel, filedialog, messagebox,
 from .reporter import export_report
 from .scanner import (
     FileIssue,
+    OneDriveStatus,
     ScanResult,
     SyncScanner,
     check_onedrive_sync_status,
+    default_profile_paths,
     resolve_onedrive_compare_root,
     safe_to_wipe_paths,
 )
+
+PRIMARY_FOLDERS = ("Desktop", "Documents", "Pictures")
 
 
 class DetailsWindow:
     def __init__(self, parent: Tk, result: ScanResult) -> None:
         self.result = result
         self.window = Toplevel(parent)
-        self.window.title("Forensics Details")
-        self.window.geometry("1100x500")
+        self.window.title("File Details")
+        self.window.geometry("1040x520")
+        self.window.minsize(820, 420)
 
-        self.show_only_problems = BooleanVar(value=True)
-        self.show_cloud_only = BooleanVar(value=True)
-        self.show_critical_only = BooleanVar(value=False)
+        frame = ttk.Frame(self.window, padding=14)
+        frame.pack(fill="both", expand=True)
 
-        controls = ttk.Frame(self.window)
-        controls.pack(fill="x", padx=10, pady=8)
+        columns = ("file", "issue", "local", "cloud", "severity")
+        tree = ttk.Treeview(frame, columns=columns, show="headings")
+        tree.pack(side="left", fill="both", expand=True)
 
-        ttk.Checkbutton(controls, text="Show Only Problems", variable=self.show_only_problems, command=self.refresh).pack(
-            side="left", padx=6
-        )
-        ttk.Checkbutton(controls, text="Show Cloud-Only", variable=self.show_cloud_only, command=self.refresh).pack(
-            side="left", padx=6
-        )
-        ttk.Checkbutton(controls, text="Show Critical Files", variable=self.show_critical_only, command=self.refresh).pack(
-            side="left", padx=6
-        )
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        scrollbar.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=scrollbar.set)
 
-        columns = ("file", "issue", "local", "cloud", "status")
-        self.tree = ttk.Treeview(self.window, columns=columns, show="headings")
-        self.tree.pack(fill="both", expand=True, padx=10, pady=10)
+        for column, heading, width in (
+            ("file", "File", 520),
+            ("issue", "Issue", 170),
+            ("local", "Local Size", 100),
+            ("cloud", "OneDrive Size", 120),
+            ("severity", "Severity", 90),
+        ):
+            tree.heading(column, text=heading)
+            tree.column(column, width=width, stretch=column == "file")
 
-        self.tree.heading("file", text="File")
-        self.tree.heading("issue", text="Issue")
-        self.tree.heading("local", text="Local Size")
-        self.tree.heading("cloud", text="Cloud Size")
-        self.tree.heading("status", text="Status")
-
-        self.tree.column("file", width=550)
-        self.tree.column("issue", width=130)
-        self.tree.column("local", width=100)
-        self.tree.column("cloud", width=100)
-        self.tree.column("status", width=100)
-
-        self.refresh()
+        for issue in result.issues:
+            tree.insert(
+                "",
+                "end",
+                values=(
+                    issue.file_path,
+                    issue.issue_type.replace("_", " ").title(),
+                    self._display_size(issue.local_size),
+                    self._display_size(issue.cloud_size),
+                    issue.severity.upper(),
+                ),
+            )
 
     def _display_size(self, size: int | None) -> str:
         if size is None:
             return "-"
-        units = ["B", "KB", "MB", "GB", "TB"]
+        units = ("B", "KB", "MB", "GB", "TB")
         value = float(size)
         for unit in units:
             if value < 1024 or unit == units[-1]:
@@ -69,312 +74,346 @@ class DetailsWindow:
             value /= 1024
         return str(size)
 
-    def _allow_issue(self, issue: FileIssue) -> bool:
-        if self.show_critical_only.get() and issue.severity != "critical":
-            return False
-        if not self.show_cloud_only.get() and issue.issue_type == "cloud_only":
-            return False
-        if self.show_only_problems.get():
-            return True
-        return True
-
-    def refresh(self) -> None:
-        for row in self.tree.get_children():
-            self.tree.delete(row)
-
-        for issue in self.result.issues:
-            if not self._allow_issue(issue):
-                continue
-            status = "🚨" if issue.severity == "critical" else "⚠"
-            self.tree.insert(
-                "",
-                "end",
-                values=(
-                    issue.file_path,
-                    issue.issue_type,
-                    self._display_size(issue.local_size),
-                    self._display_size(issue.cloud_size),
-                    status,
-                ),
-            )
-
 
 class SyncVerifierApp:
     def __init__(self) -> None:
         self.scanner = SyncScanner()
         self.root = Tk()
         self.root.title("Sync Integrity Verifier")
-        self.root.geometry("960x560")
+        self.root.geometry("1040x760")
+        self.root.minsize(940, 720)
 
-        self.selected_directory = StringVar(value=str(Path.home()))
-        self.status_text = StringVar(value="Status: Idle")
-        self.last_scan_text = StringVar(value="Last Scan: Never")
-        self.progress_text = StringVar(value="Files Checked: 0 | Issues Found: 0 | Speed: -")
-        self.comparison_target_text = StringVar(value="Comparison Target: None")
-        self.onedrive_status_text = StringVar(value="OneDrive Sync: Checking...")
-
+        self.onedrive_status: OneDriveStatus | None = None
+        self.scope = StringVar(value="primary")
+        self.custom_path = StringVar(value=str(Path.home()))
+        self.one_drive_text = StringVar(value="Looking for OneDrive...")
+        self.scope_text = StringVar(value="Desktop, Documents, and Pictures")
+        self.target_text = StringVar(value="Target will appear after OneDrive is found.")
+        self.result_title = StringVar(value="Ready")
+        self.result_detail = StringVar(value="Choose what to compare, then run the check.")
+        self.progress_text = StringVar(value="No scan running")
+        self.verified_text = StringVar(value="0")
+        self.compared_text = StringVar(value="0")
+        self.issues_text = StringVar(value="0")
+        self.cloud_text = StringVar(value="0")
         self.hash_verify = BooleanVar(value=False)
 
         self.current_result: ScanResult | None = None
         self.scan_thread: threading.Thread | None = None
         self.cancel_event = threading.Event()
+        self._loading = True
+        self._spinner = itertools.cycle(("Looking for OneDrive", "Looking for OneDrive.", "Looking for OneDrive.."))
 
-        self._build_ui()
-        self._refresh_onedrive_status(silent=True)
+        self._style()
+        self._build()
+        self._detect_onedrive_async()
+        self._animate_detection()
 
-    def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=14)
+    def _style(self) -> None:
+        style = ttk.Style(self.root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        self.root.configure(bg="#fbfcfd")
+        style.configure(".", font=("Segoe UI", 10))
+        style.configure("TFrame", background="#fbfcfd")
+        style.configure("Panel.TFrame", background="#ffffff")
+        style.configure("TLabel", background="#fbfcfd", foreground="#18212b")
+        style.configure("Panel.TLabel", background="#ffffff", foreground="#18212b")
+        style.configure("Muted.TLabel", background="#ffffff", foreground="#667789")
+        style.configure("Title.TLabel", background="#fbfcfd", foreground="#18212b", font=("Segoe UI Semibold", 20))
+        style.configure("Step.TLabel", background="#ffffff", foreground="#18212b", font=("Segoe UI Semibold", 13))
+        style.configure("Metric.TLabel", background="#ffffff", foreground="#18212b", font=("Segoe UI Semibold", 20))
+        style.configure("Primary.TButton", font=("Segoe UI Semibold", 10), padding=(18, 9))
+        style.configure("TButton", padding=(12, 8))
+        style.configure("TRadiobutton", background="#ffffff")
+        style.configure("TCheckbutton", background="#ffffff")
+        style.configure("Horizontal.TProgressbar", thickness=10)
+
+    def _build(self) -> None:
+        outer = ttk.Frame(self.root, padding=18)
         outer.pack(fill="both", expand=True)
 
-        top = ttk.Frame(outer)
-        top.pack(fill="x", pady=6)
+        ttk.Label(outer, text="Sync Integrity Verifier", style="Title.TLabel").pack(anchor="w", pady=(0, 14))
 
-        ttk.Entry(top, textvariable=self.selected_directory).pack(side="left", fill="x", expand=True, padx=6)
-        ttk.Button(top, text="Select Directory", command=self.select_directory).pack(side="left", padx=4)
-        ttk.Button(top, text="Quick Scan", command=lambda: self.start_scan("quick")).pack(side="left", padx=4)
+        top = ttk.Frame(outer, style="Panel.TFrame", padding=16)
+        top.pack(fill="x", pady=(0, 12))
+        ttk.Label(top, text="1. OneDrive folder", style="Step.TLabel").pack(anchor="w")
+        ttk.Label(top, textvariable=self.one_drive_text, style="Muted.TLabel", wraplength=880).pack(anchor="w", pady=(6, 10))
+        self.detect_bar = ttk.Progressbar(top, orient="horizontal", mode="indeterminate")
+        self.detect_bar.pack(fill="x")
+        self.detect_bar.start(14)
 
-        options = ttk.Frame(outer)
-        options.pack(fill="x", pady=4)
-        ttk.Label(options, text="OneDrive comparison: ENFORCED").pack(side="left", padx=6)
-        ttk.Checkbutton(options, text="Hash Verify (Optional)", variable=self.hash_verify).pack(side="left", padx=6)
+        middle = ttk.Frame(outer)
+        middle.pack(fill="both", expand=True)
 
-        scope = ttk.LabelFrame(outer, text="Scan Scope", padding=10)
-        scope.pack(fill="x", pady=8)
+        left = ttk.Frame(middle, style="Panel.TFrame", padding=16)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 12))
+        ttk.Label(left, text="2. Choose what to compare", style="Step.TLabel").pack(anchor="w")
+        self._scope_option(left, "primary", "Default folders", "Desktop, Documents, and Pictures")
+        self._scope_option(left, "profile", "Entire user profile", str(Path.home()))
+        self._scope_option(left, "drive", "Entire drive", Path.home().anchor or "Current drive")
+        self._scope_option(left, "custom", "Custom folder", self.custom_path.get())
+        ttk.Button(left, text="Browse custom folder", command=self.select_custom_path).pack(anchor="w", pady=(12, 0))
+        ttk.Label(left, textvariable=self.scope_text, style="Muted.TLabel", wraplength=430).pack(anchor="w", pady=(12, 0))
+        ttk.Separator(left).pack(fill="x", pady=14)
+        ttk.Label(left, text="3. Confirm and scan", style="Step.TLabel").pack(anchor="w")
+        ttk.Label(left, textvariable=self.target_text, style="Muted.TLabel", wraplength=430).pack(anchor="w", pady=(6, 10))
+        ttk.Checkbutton(left, text="Hash verify files after size checks", variable=self.hash_verify).pack(anchor="w")
+        buttons = ttk.Frame(left, style="Panel.TFrame")
+        buttons.pack(fill="x", pady=(14, 0))
+        ttk.Button(buttons, text="Run Check", style="Primary.TButton", command=self.start_scan).pack(side="left")
+        ttk.Button(buttons, text="Safe To Wipe", command=self.safe_to_wipe_check).pack(side="left", padx=(8, 0))
 
-        ttk.Button(scope, text="Entire User Profile", command=self.scan_user_profile).pack(side="left", padx=4)
-        ttk.Button(scope, text="Desktop / Documents / Downloads", command=self.scan_standard_folders).pack(
-            side="left", padx=4
-        )
-        ttk.Button(scope, text="Custom Path", command=self.select_directory).pack(side="left", padx=4)
-        ttk.Button(scope, text="Entire Drive", command=self.scan_entire_drive).pack(side="left", padx=4)
+        right = ttk.Frame(middle, style="Panel.TFrame", padding=16)
+        right.pack(side="right", fill="both", expand=True)
+        ttk.Label(right, textvariable=self.result_title, style="Step.TLabel").pack(anchor="w")
+        ttk.Label(right, textvariable=self.result_detail, style="Muted.TLabel", wraplength=380).pack(anchor="w", pady=(6, 12))
 
-        actions = ttk.Frame(outer)
-        actions.pack(fill="x", pady=8)
-        ttk.Button(actions, text="Run Integrity Check", command=lambda: self.start_scan("full")).pack(side="left", padx=4)
-        ttk.Button(actions, text="Safe To Wipe Check", command=self.safe_to_wipe_check).pack(side="left", padx=4)
-        ttk.Button(actions, text="Cancel", command=self.cancel_scan).pack(side="left", padx=4)
+        metrics = ttk.Frame(right, style="Panel.TFrame")
+        metrics.pack(fill="x", pady=(0, 12))
+        self._metric(metrics, "Files OK", self.verified_text).grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=(0, 8))
+        self._metric(metrics, "Files checked", self.compared_text).grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 8))
+        self._metric(metrics, "Need attention", self.issues_text).grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        self._metric(metrics, "Online only", self.cloud_text).grid(row=1, column=1, sticky="ew", padx=(8, 0))
+        metrics.columnconfigure((0, 1), weight=1)
 
-        status_frame = ttk.LabelFrame(outer, text="Scan Summary", padding=10)
-        status_frame.pack(fill="x", pady=8)
-        ttk.Label(status_frame, textvariable=self.last_scan_text).pack(anchor="w")
-        ttk.Label(status_frame, textvariable=self.status_text).pack(anchor="w")
-        ttk.Label(status_frame, textvariable=self.progress_text).pack(anchor="w")
-        ttk.Label(status_frame, textvariable=self.comparison_target_text).pack(anchor="w")
-        ttk.Label(status_frame, textvariable=self.onedrive_status_text).pack(anchor="w")
+        self.scan_bar = ttk.Progressbar(right, orient="horizontal", mode="determinate")
+        self.scan_bar.pack(fill="x", pady=(0, 8))
+        ttk.Label(right, textvariable=self.progress_text, style="Muted.TLabel").pack(anchor="w")
 
-        self.progress = ttk.Progressbar(outer, orient="horizontal", mode="determinate")
-        self.progress.pack(fill="x", pady=8)
+        self.report = ttk.Label(right, text="No report yet.", style="Panel.TLabel", justify="left", anchor="nw", wraplength=430)
+        self.report.pack(fill="both", expand=True, pady=(14, 0))
 
-        self.report = ttk.Label(
-            outer,
-            text="SYNC INTEGRITY REPORT\n\nNo scans yet.",
-            justify="left",
-            anchor="w",
-            padding=12,
-            relief="groove",
-        )
-        self.report.pack(fill="both", expand=True, pady=8)
+        footer = ttk.Frame(right, style="Panel.TFrame")
+        footer.pack(fill="x", pady=(10, 0))
+        ttk.Button(footer, text="Details", command=self.view_details).pack(side="left")
+        ttk.Button(footer, text="Export", command=self.export_current_report).pack(side="left", padx=(8, 0))
+        ttk.Button(footer, text="Cancel", command=self.cancel_scan).pack(side="right")
 
-        bottom = ttk.Frame(outer)
-        bottom.pack(fill="x", pady=4)
-        ttk.Button(bottom, text="View Details", command=self.view_details).pack(side="left", padx=4)
-        ttk.Button(bottom, text="Export Report", command=self.export_current_report).pack(side="left", padx=4)
-        ttk.Button(bottom, text="Re-scan", command=lambda: self.start_scan("full")).pack(side="left", padx=4)
+    def _scope_option(self, parent: ttk.Frame, value: str, title: str, hint: str) -> None:
+        row = ttk.Frame(parent, style="Panel.TFrame")
+        row.pack(fill="x", pady=(10, 0))
+        ttk.Radiobutton(row, text=title, value=value, variable=self.scope, command=self._scope_changed).pack(side="left")
+        ttk.Label(row, text=hint, style="Muted.TLabel").pack(side="right")
 
-    def select_directory(self) -> None:
-        selected = filedialog.askdirectory(initialdir=self.selected_directory.get())
+    def _metric(self, parent: ttk.Frame, title: str, value: StringVar) -> ttk.Frame:
+        frame = ttk.Frame(parent, style="Panel.TFrame", padding=10)
+        ttk.Label(frame, textvariable=value, style="Metric.TLabel").pack(anchor="w")
+        ttk.Label(frame, text=title, style="Muted.TLabel").pack(anchor="w")
+        return frame
+
+    def _detect_onedrive_async(self) -> None:
+        self._loading = True
+        threading.Thread(target=self._detect_onedrive, daemon=True).start()
+
+    def _detect_onedrive(self) -> None:
+        time.sleep(0.35)
+        status = check_onedrive_sync_status()
+        self.root.after(0, lambda: self._finish_detection(status))
+
+    def _finish_detection(self, status: OneDriveStatus) -> None:
+        self.onedrive_status = status
+        self._loading = False
+        self.detect_bar.stop()
+        if status.root and status.sync_available:
+            self.one_drive_text.set(f"Found: {status.root}\n{status.reason}")
+        else:
+            self.one_drive_text.set(status.reason)
+        self._update_scope()
+
+    def _animate_detection(self) -> None:
+        if self._loading:
+            self.one_drive_text.set(next(self._spinner))
+        self.root.after(240, self._animate_detection)
+
+    def _scope_changed(self) -> None:
+        if self.scope.get() == "custom":
+            self.select_custom_path()
+        self._update_scope()
+
+    def _update_scope(self) -> None:
+        paths = self._selected_paths()
+        if self.scope.get() == "primary":
+            found_names = [path.name for path in paths]
+            missing = [name for name in PRIMARY_FOLDERS if name not in found_names]
+            message = "Default folders found:\n" + "\n".join(f"- {path.name}: {path}" for path in paths)
+            if missing:
+                message += "\n\nNot found on this PC: " + ", ".join(missing)
+            self.scope_text.set(message)
+        elif len(paths) == 1:
+            self.scope_text.set(str(paths[0]))
+        else:
+            self.scope_text.set("; ".join(str(path) for path in paths))
+
+        if self.onedrive_status and self.onedrive_status.root:
+            targets = [resolve_onedrive_compare_root(path, self.onedrive_status.root) for path in paths]
+            if len(targets) == 1:
+                self.target_text.set(f"OneDrive target:\n{targets[0]}")
+            else:
+                self.target_text.set("OneDrive targets:\n" + "\n".join(f"- {target}" for target in targets))
+
+    def _selected_paths(self) -> list[Path]:
+        if self.scope.get() == "primary":
+            return default_profile_paths()
+        if self.scope.get() == "profile":
+            return [Path.home()]
+        if self.scope.get() == "drive":
+            home = Path.home()
+            return [Path(home.anchor or str(home))]
+        return [Path(self.custom_path.get()).expanduser()]
+
+    def select_custom_path(self) -> None:
+        selected = filedialog.askdirectory(initialdir=self.custom_path.get())
         if selected:
-            self.selected_directory.set(selected)
+            self.custom_path.set(selected)
+            self.scope.set("custom")
+        self._update_scope()
 
-    def scan_user_profile(self) -> None:
-        self.selected_directory.set(str(Path.home()))
+    def _can_scan(self) -> bool:
+        if self.scan_thread and self.scan_thread.is_alive():
+            messagebox.showinfo("Scan Running", "A scan is already in progress.")
+            return False
+        if not self.onedrive_status or not self.onedrive_status.root:
+            messagebox.showerror("OneDrive Not Found", "OneDrive folder could not be found.")
+            return False
+        return True
 
-    def scan_standard_folders(self) -> None:
-        candidates = safe_to_wipe_paths()
-        if candidates:
-            self.selected_directory.set(str(candidates[0].parent))
+    def start_scan(self) -> None:
+        if self._can_scan():
+            self._run_paths(self._selected_paths(), "Checking files")
 
-    def scan_entire_drive(self) -> None:
-        path = Path(self.selected_directory.get())
-        anchor = path.anchor if path.anchor else str(path)
-        self.selected_directory.set(anchor or str(path))
+    def safe_to_wipe_check(self) -> None:
+        if self._can_scan():
+            paths = safe_to_wipe_paths()
+            if not paths:
+                messagebox.showwarning("No Folders", "Desktop, Documents, or Pictures could not be found.")
+                return
+            self._run_paths(paths, "Safe to wipe check")
 
-    def _resolve_compare_target(self, directory: str) -> str | None:
-        status = check_onedrive_sync_status()
-        if not status.sync_available or not status.root:
-            return None
+    def _run_paths(self, paths: list[Path], title: str) -> None:
+        self.cancel_event.clear()
+        self.result_title.set(title)
+        self.result_detail.set("Checking every file we can see in the selected folders.")
+        self.progress_text.set("Starting...")
+        self.scan_bar["value"] = 0
+        self.scan_thread = threading.Thread(target=self._scan_worker, args=(paths,), daemon=True)
+        self.scan_thread.start()
 
-        scan_root = Path(directory).expanduser().resolve()
-        return str(resolve_onedrive_compare_root(scan_root, status.root))
+    def _scan_worker(self, paths: list[Path]) -> None:
+        assert self.onedrive_status and self.onedrive_status.root
+        aggregate = ScanResult(directory="; ".join(str(path) for path in paths), hash_verification_enabled=self.hash_verify.get())
+        aggregate.started_at = time.time()
 
-    def _refresh_onedrive_status(self, silent: bool) -> bool:
-        status = check_onedrive_sync_status()
-        if status.sync_available:
-            root_text = str(status.root) if status.root else "Unknown"
-            self.onedrive_status_text.set(f"OneDrive Sync: Ready ({root_text})")
-            return True
+        for index, path in enumerate(paths, start=1):
+            if self.cancel_event.is_set():
+                break
+            compare_target = resolve_onedrive_compare_root(path.resolve(), self.onedrive_status.root)
 
-        self.onedrive_status_text.set(f"OneDrive Sync: Not Ready ({status.reason})")
-        if not silent:
-            messagebox.showerror("OneDrive Not Ready", status.reason)
-        return False
+            def progress(current: int, total: int, path_name: str = path.name or str(path), path_index: int = index) -> None:
+                percent = ((path_index - 1) + (current / max(total, 1))) / max(len(paths), 1) * 100
+                self.root.after(0, lambda: self._set_progress(percent, f"{path_name}: {current} of {total} files"))
 
-    def _preflight_onedrive(self) -> bool:
-        return self._refresh_onedrive_status(silent=False)
+            partial = self.scanner.scan(
+                str(path),
+                progress_callback=progress,
+                cancel_event=self.cancel_event,
+                compare_root=str(compare_target),
+                hash_verify=self.hash_verify.get(),
+            )
+            if not aggregate.comparison_target:
+                aggregate.comparison_target = str(compare_target)
+            aggregate.folder_summaries.append(
+                {
+                    "name": path.name or str(path),
+                    "path": str(path),
+                    "target": str(compare_target),
+                    "scanned": partial.scanned_files,
+                    "verified": partial.verified_files,
+                    "issues": partial.integrity_issues,
+                    "cloud_only": partial.cloud_only_files,
+                }
+            )
+            aggregate.scanned_files += partial.scanned_files
+            aggregate.compared_files += partial.compared_files
+            aggregate.hash_files_checked += partial.hash_files_checked
+            aggregate.hash_mismatches += partial.hash_mismatches
+            aggregate.verified_files += partial.verified_files
+            aggregate.cloud_only_files += partial.cloud_only_files
+            aggregate.integrity_issues += partial.integrity_issues
+            aggregate.issues.extend(partial.issues)
+
+        aggregate.risk_level, aggregate.recommendation = self.scanner._risk_profile(aggregate)
+        aggregate.finished_at = time.time()
+        self.root.after(0, lambda: self._show_result(aggregate, self.cancel_event.is_set()))
+
+    def _set_progress(self, percent: float, text: str) -> None:
+        self.scan_bar["value"] = percent
+        self.progress_text.set(text)
+
+    def _show_result(self, result: ScanResult, cancelled: bool) -> None:
+        self.current_result = result
+        self.scan_bar["value"] = 100 if not cancelled else self.scan_bar["value"]
+        self.progress_text.set(f"{result.scanned_files} files checked in {result.duration_seconds:.1f}s")
+        self.verified_text.set(str(result.verified_files))
+        self.compared_text.set(str(result.compared_files))
+        self.issues_text.set(str(result.integrity_issues))
+        self.cloud_text.set(str(result.cloud_only_files))
+
+        if cancelled:
+            self.result_title.set("Cancelled")
+            self.result_detail.set("The scan stopped before finishing.")
+        elif result.risk_level == "LOW":
+            self.result_title.set("Looks safe")
+            self.result_detail.set("No missing, mismatched, or online-only files were found in the checked folders.")
+        elif result.risk_level == "MEDIUM":
+            self.result_title.set("Review before wiping")
+            self.result_detail.set("Some files are online-only. Open OneDrive and make sure they are downloaded if you need them on this PC.")
+        else:
+            self.result_title.set("Do not wipe yet")
+            self.result_detail.set("Some files do not appear to match OneDrive. Fix these before wiping or reinstalling.")
+
+        self.report.configure(text=self._plain_report(result))
+
+    def _plain_report(self, result: ScanResult) -> str:
+        folder_lines = []
+        for summary in result.folder_summaries:
+            folder_lines.append(
+                f"- {summary['name']}: checked {summary['scanned']} files, "
+                f"{summary['verified']} OK, {summary['issues']} need attention, "
+                f"{summary['cloud_only']} online-only"
+            )
+
+        if not folder_lines:
+            folder_lines.append("- No files were found in the selected folder.")
+
+        if result.integrity_issues:
+            meaning = (
+                "Meaning: at least one file is missing from the OneDrive match, has a different size, "
+                "or could not be checked. Do not wipe this PC yet."
+            )
+        elif result.cloud_only_files:
+            meaning = "Meaning: files exist in OneDrive but may not be downloaded locally. Review them before wiping."
+        else:
+            meaning = "Meaning: the checked files matched what the app expected in OneDrive."
+
+        hash_text = "On" if result.hash_verification_enabled else "Off"
+        return (
+            "What was checked:\n"
+            + "\n".join(folder_lines)
+            + "\n\nPlain result:\n"
+            + meaning
+            + "\n\nTotals:\n"
+            f"- Files checked: {result.scanned_files}\n"
+            f"- Files OK: {result.verified_files}\n"
+            f"- Need attention: {result.integrity_issues}\n"
+            f"- Online-only: {result.cloud_only_files}\n"
+            f"- Hash check: {hash_text}\n"
+            f"- Risk: {result.risk_level}"
+        )
 
     def cancel_scan(self) -> None:
         self.cancel_event.set()
-        self.status_text.set("Status: Cancelling...")
-
-    def start_scan(self, mode: str) -> None:
-        if self.scan_thread and self.scan_thread.is_alive():
-            messagebox.showinfo("Scan Running", "A scan is already in progress.")
-            return
-
-        directory = self.selected_directory.get().strip()
-        if not directory:
-            messagebox.showerror("Missing Directory", "Select a directory first.")
-            return
-
-        if not self._preflight_onedrive():
-            return
-
-        self.cancel_event.clear()
-        self.status_text.set("Status: Scanning Files...")
-        self.progress["value"] = 0
-
-        compare_target = self._resolve_compare_target(directory)
-        self.scan_thread = threading.Thread(
-            target=self._run_scan,
-            args=(directory, mode, compare_target, self.hash_verify.get()),
-            daemon=True,
-        )
-        self.scan_thread.start()
-
-    def _run_scan(self, directory: str, mode: str, compare_target: str | None, hash_verify: bool) -> None:
-        started = time.time()
-        issue_counter = {"count": 0}
-
-        def progress_update(current: int, total: int) -> None:
-            percent = (current / max(total, 1)) * 100
-            elapsed = max(time.time() - started, 0.001)
-            speed = int(current / elapsed)
-            self.progress["value"] = percent
-            self.progress_text.set(f"Files Checked: {current} | Issues Found: {issue_counter['count']} | Speed: {speed} files/s")
-            self.root.update_idletasks()
-
-        result = self.scanner.scan(
-            directory,
-            progress_callback=progress_update,
-            cancel_event=self.cancel_event,
-            compare_root=compare_target,
-            hash_verify=hash_verify,
-        )
-        issue_counter["count"] = len(result.issues)
-
-        if mode == "quick":
-            result.recommendation = "Quick scan complete. Run full check for deeper validation."
-
-        self.current_result = result
-        self.last_scan_text.set(f"Last Scan: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-        self.status_text.set("Status: Completed" if not self.cancel_event.is_set() else "Status: Cancelled")
-        self.progress_text.set(
-            f"Files Checked: {result.scanned_files} | Issues Found: {len(result.issues)} | Speed: complete"
-        )
-        self.comparison_target_text.set(f"Comparison Target: {result.comparison_target or 'None'}")
-
-        report_text = (
-            "SYNC INTEGRITY REPORT\n\n"
-            f"Directory: {result.directory}\n"
-            f"Comparison Target: {result.comparison_target or 'None'}\n"
-            f"Hash Verification: {'ON' if result.hash_verification_enabled else 'OFF'}\n\n"
-            f"✅ {result.verified_files} Files Verified\n"
-            f"🔍 {result.compared_files} Files Compared\n"
-            f"#️⃣ {result.hash_files_checked} Hashes Checked\n"
-            f"⚠ {result.cloud_only_files} Cloud-Only Files\n"
-            f"🚨 {result.integrity_issues} Integrity Issues\n\n"
-            f"RISK LEVEL: {result.risk_level}\n"
-            f"Recommendation: {result.recommendation}"
-        )
-        self.report.configure(text=report_text)
-
-    def safe_to_wipe_check(self) -> None:
-        paths = safe_to_wipe_paths()
-        if not paths:
-            messagebox.showwarning("No Standard Paths", "Could not find Desktop/Documents/Downloads to scan.")
-            return
-
-        if not self._preflight_onedrive():
-            return
-
-        if self.scan_thread and self.scan_thread.is_alive():
-            messagebox.showinfo("Scan Running", "A scan is already in progress.")
-            return
-
-        self.cancel_event.clear()
-        self.status_text.set("Status: Running Safe To Wipe Check...")
-        self.progress["value"] = 0
-
-        def run_combined() -> None:
-            aggregate = ScanResult(directory="Safe To Wipe Scope", hash_verification_enabled=self.hash_verify.get())
-            aggregate.started_at = time.time()
-
-            status = check_onedrive_sync_status()
-            onedrive_root = status.root if status.sync_available else None
-
-            for p in paths:
-                if self.cancel_event.is_set():
-                    break
-
-                compare_target = None
-                if onedrive_root:
-                    compare_target = str(resolve_onedrive_compare_root(p.resolve(), onedrive_root))
-
-                partial = self.scanner.scan(
-                    str(p),
-                    cancel_event=self.cancel_event,
-                    compare_root=compare_target,
-                    hash_verify=self.hash_verify.get(),
-                )
-                if partial.comparison_target and not aggregate.comparison_target:
-                    aggregate.comparison_target = partial.comparison_target
-
-                aggregate.scanned_files += partial.scanned_files
-                aggregate.compared_files += partial.compared_files
-                aggregate.hash_files_checked += partial.hash_files_checked
-                aggregate.hash_mismatches += partial.hash_mismatches
-                aggregate.verified_files += partial.verified_files
-                aggregate.cloud_only_files += partial.cloud_only_files
-                aggregate.integrity_issues += partial.integrity_issues
-                aggregate.issues.extend(partial.issues)
-
-            aggregate.risk_level, aggregate.recommendation = self.scanner._risk_profile(aggregate)
-            aggregate.finished_at = time.time()
-
-            self.current_result = aggregate
-            self.last_scan_text.set(f"Last Scan: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            self.status_text.set("Status: Completed")
-            self.comparison_target_text.set(f"Comparison Target: {aggregate.comparison_target or 'None'}")
-
-            if aggregate.risk_level == "LOW":
-                status = "✅ SAFE TO WIPE"
-            else:
-                status = "🚨 NOT SAFE TO WIPE"
-
-            details = (
-                f"WIPE SAFETY STATUS\n\n{status}\n\n"
-                f"Compared Files: {aggregate.compared_files}\n"
-                f"Hash Checks: {aggregate.hash_files_checked}\n"
-                f"Hash Mismatches: {aggregate.hash_mismatches}\n"
-                f"Detected Issues:\n"
-                f"• {aggregate.integrity_issues} Files Not Fully Synced\n"
-                f"• {aggregate.cloud_only_files} Cloud-Only Files\n\n"
-                f"Recommendation:\n{aggregate.recommendation}"
-            )
-            self.report.configure(text=details)
-
-        self.scan_thread = threading.Thread(target=run_combined, daemon=True)
-        self.scan_thread.start()
+        self.progress_text.set("Cancelling...")
 
     def view_details(self) -> None:
         if not self.current_result:
@@ -386,20 +425,14 @@ class SyncVerifierApp:
         if not self.current_result:
             messagebox.showinfo("No Results", "Run a scan first.")
             return
-
         output_path = filedialog.asksaveasfilename(
             title="Export Report",
             defaultextension=".pdf",
             filetypes=[("PDF", "*.pdf"), ("CSV", "*.csv"), ("JSON", "*.json"), ("Text", "*.txt")],
         )
-        if not output_path:
-            return
-
-        try:
+        if output_path:
             export_report(self.current_result, output_path)
             messagebox.showinfo("Export Complete", f"Report exported to:\n{output_path}")
-        except OSError as exc:
-            messagebox.showerror("Export Failed", str(exc))
 
     def run(self) -> None:
         self.root.mainloop()
